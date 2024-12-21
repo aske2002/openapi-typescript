@@ -14,9 +14,10 @@ import {
   useQuery,
   useSuspenseQuery,
   useInfiniteQuery,
+  InfiniteData,
 } from "@tanstack/react-query";
-import type { ClientMethod, FetchResponse, MaybeOptionalInit, Client as FetchClient } from "openapi-fetch";
-import type { HttpMethod, MediaType, PathsWithMethod, RequiredKeysOf } from "openapi-typescript-helpers";
+import type { ClientMethod, FetchResponse, MaybeOptionalInit, Client as FetchClient, ParamsOption } from "openapi-fetch";
+import type { FilterKeys, HttpMethod, MediaType, PathsWithMethod, RequiredKeysOf } from "openapi-typescript-helpers";
 
 type InitWithUnknowns<Init> = Init & { [key: string]: unknown };
 
@@ -24,7 +25,8 @@ export type QueryKey<
   Paths extends Record<string, Record<HttpMethod, {}>>,
   Method extends HttpMethod,
   Path extends PathsWithMethod<Paths, Method>,
-> = readonly [Method, Path, MaybeOptionalInit<Paths[Path], Method>];
+  PageKeyAccessor = PathKeyOfWithMethod<Paths, Method, Path> | undefined,
+> = PageKeyAccessor extends undefined ? [Method, Path, MaybeOptionalInit<Paths[Path], Method>] : [Method, Path, MaybeOptionalInit<Paths[Path], Method>, PageKeyAccessor];
 
 export type QueryOptionsFunction<Paths extends Record<string, Record<HttpMethod, {}>>, Media extends MediaType> = <
   Method extends HttpMethod,
@@ -98,7 +100,7 @@ export type UseInfiniteQueryMethod<Paths extends Record<string, Record<HttpMetho
   ...[init, options, queryClient]: RequiredKeysOf<Init> extends never
     ? [
         InitWithUnknowns<Init>?,
-        Omit<
+        (Omit<
           UseInfiniteQueryOptions<
             Response["data"],
             Response["error"],
@@ -107,12 +109,12 @@ export type UseInfiniteQueryMethod<Paths extends Record<string, Record<HttpMetho
             QueryKey<Paths, Method, Path>
           >,
           "queryKey" | "queryFn"
-        >?,
+        > & { pageAccessor?: PathKeyOfWithMethod<Paths, Method, Path> })?,
         QueryClient?,
       ]
     : [
         InitWithUnknowns<Init>,
-        Omit<
+        (Omit<
           UseInfiniteQueryOptions<
             Response["data"],
             Response["error"],
@@ -121,10 +123,10 @@ export type UseInfiniteQueryMethod<Paths extends Record<string, Record<HttpMetho
             QueryKey<Paths, Method, Path>
           >,
           "queryKey" | "queryFn"
-        >?,
+        > & { pageAccessor?: PathKeyOfWithMethod<Paths, Method, Path>  })?,
         QueryClient?,
       ]
-) => UseInfiniteQueryResult<Response["data"], Response["error"]>;
+) => UseInfiniteQueryResult<InfiniteData<Response["data"]>, Response["error"]>;
 
 export type UseMutationMethod<Paths extends Record<string, Record<HttpMethod, {}>>, Media extends MediaType> = <
   Method extends HttpMethod,
@@ -147,6 +149,32 @@ export interface OpenapiQueryClient<Paths extends {}, Media extends MediaType = 
   useMutation: UseMutationMethod<Paths, Media>;
 }
 
+type DotPrefix<T extends string> = T extends "" ? "" : `.${T}`
+
+type PathKeyOf<T> = (T extends object ?
+    { [K in Exclude<keyof T, symbol>]: `${K}${DotPrefix<PathKeyOf<T[K]>>}` }[Exclude<keyof T, symbol>]
+    : "") extends infer D ? Extract<D, string> : never;
+
+type PathKeyOfWithMethod<Paths extends Record<string, Record<HttpMethod, {}>>, Method extends HttpMethod, Path extends PathsWithMethod<Paths, Method>> = PathKeyOf<ParamsOption<FilterKeys<Paths[Path], Method>>>;
+
+function setNestedValue<T extends Record<string, any>>(obj: T, path: string, value: any): void {
+  const keys = path.split('.'); // Split the dot notation into keys
+  let current: any = obj;
+
+  // Traverse the object to the second-to-last key
+  for (let i = 0; i < keys.length - 1; i++) {
+      const key = keys[i];
+      if (!(key in current) || typeof current[key] !== 'object') {
+          // If the key doesn't exist or is not an object, create an empty object
+          current[key] = {};
+      }
+      current = current[key];
+  }
+
+  // Set the value for the final key
+  current[keys[keys.length - 1]] = value;
+}
+
 // TODO: Add the ability to bring queryClient as argument
 export default function createClient<Paths extends {}, Media extends MediaType = MediaType>(
   client: FetchClient<Paths, Media>,
@@ -165,8 +193,28 @@ export default function createClient<Paths extends {}, Media extends MediaType =
     return data;
   };
 
+  const infiniteQueryFn = async <Method extends HttpMethod, Path extends PathsWithMethod<Paths, Method>, PageKeyAccessor extends PathKeyOfWithMethod<Paths, Method, Path>>({
+    queryKey: [method, path, init, pageKeyAccessor],
+    signal,
+    pageParam,
+  }: QueryFunctionContext<QueryKey<Paths, Method, Path, PageKeyAccessor>>) => {
+    
+    if (pageKeyAccessor !== undefined && pageParam !== undefined) {
+      setNestedValue(init ?? {}, pageKeyAccessor, pageParam);
+    }
+
+    const mth = method.toUpperCase() as Uppercase<typeof method>;
+    const fn = client[mth] as ClientMethod<Paths, typeof method, Media>;
+    const { data, error } = await fn(path, { signal, ...(init as any) }); // TODO: find a way to avoid as any
+    if (error) {
+      throw error;
+    }
+
+    return data;
+  };
+
   const queryOptions: QueryOptionsFunction<Paths, Media> = (method, path, ...[init, options]) => ({
-    queryKey: [method, path, init as InitWithUnknowns<typeof init>] as const,
+    queryKey: [method, path, init as InitWithUnknowns<typeof init>,] as const,
     queryFn,
     ...options,
   });
@@ -189,10 +237,10 @@ export default function createClient<Paths extends {}, Media extends MediaType =
         QueryKey<Paths, Method, Path>
       >,
       "queryKey" | "queryFn"
-    >,
+    > & { pageAccessor?: PathKeyOfWithMethod<Paths, Method, Path> },
   ) => ({
-    queryKey: [method, path, init] as const,
-    queryFn,
+    queryKey: [method, path, init, options?.pageAccessor] as const,
+    queryFn: infiniteQueryFn,
     ...options,
   });
 
@@ -204,10 +252,10 @@ export default function createClient<Paths extends {}, Media extends MediaType =
       useSuspenseQuery(queryOptions(method, path, init as InitWithUnknowns<typeof init>, options), queryClient),
     useInfiniteQuery: (method, path, ...[init, options, queryClient]) => {
       const baseOptions = infiniteQueryOptions(method, path, init as InitWithUnknowns<typeof init>, options as any); // TODO: find a way to avoid as any
+      console.log(baseOptions);
       return useInfiniteQuery(
         {
           ...baseOptions,
-          initialPageParam: 0,
           getNextPageParam: (lastPage: any, allPages: any[], lastPageParam: number, allPageParams: number[]) =>
             options?.getNextPageParam?.(lastPage, allPages, lastPageParam, allPageParams) ?? allPages.length,
         } as any,
