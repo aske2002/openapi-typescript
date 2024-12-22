@@ -19,14 +19,39 @@ import {
 import type { ClientMethod, FetchResponse, MaybeOptionalInit, Client as FetchClient, ParamsOption } from "openapi-fetch";
 import type { FilterKeys, HttpMethod, MediaType, PathsWithMethod, RequiredKeysOf } from "openapi-typescript-helpers";
 
-type InitWithUnknowns<Init> = Init & { [key: string]: unknown };
+export type InitWithUnknowns<Init> = Init & { [key: string]: unknown };
 
 export type QueryKey<
   Paths extends Record<string, Record<HttpMethod, {}>>,
   Method extends HttpMethod,
   Path extends PathsWithMethod<Paths, Method>,
-  PageKeyAccessor = PathKeyOfWithMethod<Paths, Method, Path> | undefined,
-> = PageKeyAccessor extends undefined ? [Method, Path, MaybeOptionalInit<Paths[Path], Method>] : [Method, Path, MaybeOptionalInit<Paths[Path], Method>, PageKeyAccessor];
+  PageKeyAccessor extends PathKeyOfWithMethod<Paths, Method, Path> | undefined = undefined,
+> = [Method, Path, MaybeOptionalInit<Paths[Path], Method>, PageKeyAccessor];
+
+export type InfiniteQueryOptionsFunction<Paths extends Record<string, Record<HttpMethod, {}>>, Media extends MediaType> = <
+  Method extends HttpMethod,
+  Path extends PathsWithMethod<Paths, Method>,
+  Init extends MaybeOptionalInit<Paths[Path], Method>,
+  Response extends Required<FetchResponse<Paths[Path][Method], Init, Media>>, // note: Required is used to avoid repeating NonNullable in UseQuery types
+  PageKeyAccessor extends PathKeyOfWithMethod<Paths, Method, Path>,
+  Options extends Omit<UseInfiniteQueryOptions<Response["data"], Response["error"], Response["data"], number, QueryKey<Paths, Method, Path, PageKeyAccessor>, number>, "queryKey" | "queryFn"> & { pageAccessor: PageKeyAccessor },
+>(
+  method: Method,
+  url: Path,
+  ...[init, options, queryClient]: RequiredKeysOf<Init> extends never
+    ? [InitWithUnknowns<Init>, Options, QueryClient?]
+    : [InitWithUnknowns<Init>, Options, QueryClient?]
+) => NoInfer<
+Omit<
+  UseInfiniteQueryOptions<Response["data"], Response["error"], Response["data"], number, QueryKey<Paths, Method, Path, PageKeyAccessor>, number>,
+  "queryFn"
+> & {
+  queryFn: Exclude<
+  UseInfiniteQueryOptions<Response["data"], Response["error"], Response["data"], number, QueryKey<Paths, Method, Path, PageKeyAccessor>, number>["queryFn"],
+    SkipToken | undefined
+  >;
+}
+>;
 
 export type QueryOptionsFunction<Paths extends Record<string, Record<HttpMethod, {}>>, Media extends MediaType> = <
   Method extends HttpMethod,
@@ -94,6 +119,7 @@ export type UseInfiniteQueryMethod<Paths extends Record<string, Record<HttpMetho
   Path extends PathsWithMethod<Paths, Method>,
   Init extends MaybeOptionalInit<Paths[Path], Method>,
   Response extends Required<FetchResponse<Paths[Path][Method], Init, Media>>,
+  PageKeyAccessor extends PathKeyOfWithMethod<Paths, Method, Path>,
 >(
   method: Method,
   url: Path,
@@ -106,10 +132,10 @@ export type UseInfiniteQueryMethod<Paths extends Record<string, Record<HttpMetho
             Response["error"],
             Response["data"],
             number,
-            QueryKey<Paths, Method, Path>
+            QueryKey<Paths, Method, Path, PageKeyAccessor>
           >,
           "queryKey" | "queryFn"
-        > & { pageAccessor?: PathKeyOfWithMethod<Paths, Method, Path> })?,
+        > & { pageAccessor?: PageKeyAccessor })?,
         QueryClient?,
       ]
     : [
@@ -120,10 +146,10 @@ export type UseInfiniteQueryMethod<Paths extends Record<string, Record<HttpMetho
             Response["error"],
             Response["data"],
             number,
-            QueryKey<Paths, Method, Path>
+            QueryKey<Paths, Method, Path, PageKeyAccessor>
           >,
           "queryKey" | "queryFn"
-        > & { pageAccessor?: PathKeyOfWithMethod<Paths, Method, Path>  })?,
+        > & { pageAccessor?: PageKeyAccessor  })?,
         QueryClient?,
       ]
 ) => UseInfiniteQueryResult<InfiniteData<Response["data"]>, Response["error"]>;
@@ -143,6 +169,7 @@ export type UseMutationMethod<Paths extends Record<string, Record<HttpMethod, {}
 
 export interface OpenapiQueryClient<Paths extends {}, Media extends MediaType = MediaType> {
   queryOptions: QueryOptionsFunction<Paths, Media>;
+  infiniteQueryOptions: InfiniteQueryOptionsFunction<Paths, Media>;
   useQuery: UseQueryMethod<Paths, Media>;
   useSuspenseQuery: UseSuspenseQueryMethod<Paths, Media>;
   useInfiniteQuery: UseInfiniteQueryMethod<Paths, Media>;
@@ -155,7 +182,7 @@ type PathKeyOf<T> = (T extends object ?
     { [K in Exclude<keyof T, symbol>]: `${K}${DotPrefix<PathKeyOf<T[K]>>}` }[Exclude<keyof T, symbol>]
     : "") extends infer D ? Extract<D, string> : never;
 
-type PathKeyOfWithMethod<Paths extends Record<string, Record<HttpMethod, {}>>, Method extends HttpMethod, Path extends PathsWithMethod<Paths, Method>> = PathKeyOf<ParamsOption<FilterKeys<Paths[Path], Method>>>;
+export type PathKeyOfWithMethod<Paths extends Record<string, Record<HttpMethod, {}>>, Method extends HttpMethod, Path extends PathsWithMethod<Paths, Method>> = PathKeyOf<ParamsOption<FilterKeys<Paths[Path], Method>>>;
 
 function setNestedValue<T extends Record<string, any>>(obj: T, path: string, value: any): void {
   const keys = path.split('.'); // Split the dot notation into keys
@@ -197,7 +224,7 @@ export default function createClient<Paths extends {}, Media extends MediaType =
     queryKey: [method, path, init, pageKeyAccessor],
     signal,
     pageParam,
-  }: QueryFunctionContext<QueryKey<Paths, Method, Path, PageKeyAccessor>>) => {
+  }: QueryFunctionContext<QueryKey<Paths, Method, Path, PageKeyAccessor>, number>) => {
     
     if (pageKeyAccessor !== undefined && pageParam !== undefined) {
       setNestedValue(init ?? {}, pageKeyAccessor, pageParam);
@@ -214,38 +241,20 @@ export default function createClient<Paths extends {}, Media extends MediaType =
   };
 
   const queryOptions: QueryOptionsFunction<Paths, Media> = (method, path, ...[init, options]) => ({
-    queryKey: [method, path, init as InitWithUnknowns<typeof init>,] as const,
+    queryKey: [method, path, init as InitWithUnknowns<typeof init>, undefined] as const,
     queryFn,
     ...options,
   });
 
-  const infiniteQueryOptions = <
-    Method extends HttpMethod,
-    Path extends PathsWithMethod<Paths, Method>,
-    Init extends MaybeOptionalInit<Paths[Path], Method & keyof Paths[Path]>,
-    Response extends Required<FetchResponse<any, Init, Media>>,
-  >(
-    method: Method,
-    path: Path,
-    init?: InitWithUnknowns<Init>,
-    options?: Omit<
-      UseInfiniteQueryOptions<
-        Response["data"],
-        Response["error"],
-        Response["data"],
-        number,
-        QueryKey<Paths, Method, Path>
-      >,
-      "queryKey" | "queryFn"
-    > & { pageAccessor?: PathKeyOfWithMethod<Paths, Method, Path> },
-  ) => ({
-    queryKey: [method, path, init, options?.pageAccessor] as const,
+  const infiniteQueryOptions: InfiniteQueryOptionsFunction<Paths, Media> = (method, path, ...[init, options]) => ({
+    queryKey: [method, path, init as InitWithUnknowns<typeof init>, options.pageAccessor] as const,
     queryFn: infiniteQueryFn,
     ...options,
   });
 
   return {
     queryOptions,
+    infiniteQueryOptions,
     useQuery: (method, path, ...[init, options, queryClient]) =>
       useQuery(queryOptions(method, path, init as InitWithUnknowns<typeof init>, options), queryClient),
     useSuspenseQuery: (method, path, ...[init, options, queryClient]) =>
